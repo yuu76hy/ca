@@ -29,119 +29,144 @@ jobs:
     steps:
       - name: 1-Init + Tailscale networking
         run: |
-          echo "$LOG_PREFIX Start init"
+          set -euo pipefail
+          echo "${LOG_PREFIX} Start init"
           sudo apt update -y -qq
           sudo apt install -y curl wget jq zstd rsync sshpass -qq
           sudo rm -rf /tmp/* /var/tmp/*
 
-          if [ -n "$TAILSCALE_AUTH_KEY" ]; then
+          if [ -n "${TAILSCALE_AUTH_KEY}" ]; then
             curl -fsSL https://tailscale.com/install.sh | sudo bash
             sudo systemctl enable --now tailscaled
-            sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="github-runner-$GITHUB_RUN_ID" --accept-routes --reset
+            sudo tailscale up --authkey="${TAILSCALE_AUTH_KEY}" --hostname="gh-runner-${GITHUB_RUN_ID}" --accept-routes --reset
           fi
-          echo "$LOG_PREFIX Tailscale connected and keep running"
+          echo "${LOG_PREFIX} Tailscale ready"
 
       - name: 2-Prepare directories and permissions
         run: |
-          sudo mkdir -p "$LOCAL_BACKUP_DIR" "$LOCAL_AAA_DIR" /run/docker
-          sudo chown -R runner:runner "$LOCAL_BACKUP_DIR" "$LOCAL_AAA_DIR"
-          echo "$LOG_PREFIX Directories ready"
+          set -e
+          sudo mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_AAA_DIR}" /run/docker
+          sudo chown -R runner:runner "${LOCAL_BACKUP_DIR}" "${LOCAL_AAA_DIR}"
+          echo "${LOG_PREFIX} Directories ready"
 
       - name: 3-Parallel: Pull backup + Install environment
         run: |
-          echo "$LOG_PREFIX Start parallel tasks"
-          PID1=0
-          PID2=0
+          set -euo pipefail
+          echo "${LOG_PREFIX} Start parallel tasks"
 
-          # Thread A: Pull and restore backup
+          # 用临时文件传递子shell结果（解决子shell变量不往外传问题）
+          LOCAL_FILE_PATH="${LOCAL_BACKUP_DIR}/.backup_path"
+          rm -f "${LOCAL_FILE_PATH}"
+
+          # Thread A: 只拉取备份，不解压
           (
-            if [ -n "$TAILSCALE_AUTH_KEY" ] && [ -n "$SSH_PASS" ]; then
-              TARGET_IP=$(sudo tailscale status --json | jq -r '.Peers[] | select(.Online == true and (.HostName | contains("github-runner"))) | .TailscaleIPs[0]' | head -n 1)
-              if [ -n "$TARGET_IP" ]; then
-                LATEST=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.zst 2>/dev/null | head -n 1")
-                if [ -n "$LATEST" ]; then
-                  LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST")"
-                  sshpass -p "$SSH_PASS" rsync --partial --progress --rsh="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" "$SSH_USER@$TARGET_IP:$LATEST" "$LOCAL_FILE"
-                  sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST'"
-                  echo "BACKUP_FILE=$LOCAL_FILE" >> "$GITHUB_ENV"
-                  sudo tar -I "zstd -d -T2" -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions 2>/dev/null
-                  sudo rm -f "$LOCAL_FILE"
+            if [ -n "${TAILSCALE_AUTH_KEY}" ] && [ -n "${SSH_PASS}" ]; then
+              TARGET_IP=$(sudo tailscale status --json 2>/dev/null | jq -r '.Peers[] | select(.Online == true and (.HostName | contains("gh-runner"))) | .TailscaleIPs[0]' | head -n 1 || true)
+              if [ -n "${TARGET_IP}" ]; then
+                LATEST=$(sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "${SSH_USER}@${TARGET_IP}" "ls -t ${REMOTE_BACKUP_BASE}/casaos-*.tar.zst 2>/dev/null | head -n 1" || true)
+                if [ -n "${LATEST}" ]; then
+                  LOCAL_FILE="${LOCAL_BACKUP_DIR}/$(basename "${LATEST}")"
+                  sshpass -p "${SSH_PASS}" rsync -az --partial --rsh="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" "${SSH_USER}@${TARGET_IP}:${LATEST}" "${LOCAL_FILE}"
+                  sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "${SSH_USER}@${TARGET_IP}" "sudo rm -f \"${LATEST}\""
+                  echo "${LOCAL_FILE}" > "${LOCAL_FILE_PATH}"
                 fi
               fi
             fi
-          ) &
-          PID1=$!
+          ) & PID1=$!
 
-          # Thread B: Install Docker/CasaOS and stop business services
+          # Thread B: 安装 Docker & CasaOS
           (
-            # FIX: 修正环境变量写法（命令前缀，非单独一行）→ 解决Line52核心报错
-            curl -fsSL https://get.docker.com | sudo DEBIAN_FRONTEND=noninteractive bash
-            curl -fsSL https://get.casaos.io | sudo DEBIAN_FRONTEND=noninteractive bash || { sleep 3; curl -fsSL https://get.casaos.io | sudo DEBIAN_FRONTEND=noninteractive bash; }
+            export DEBIAN_FRONTEND=noninteractive
+            curl -fsSL https://get.docker.com | sudo bash
+            curl -fsSL https://get.casaos.io | sudo bash || { sleep 3; curl -fsSL https://get.casaos.io | sudo bash; }
 
-            if [ -n "$SSH_PASS" ]; then
-              echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
-              echo "$SSH_USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$SSH_USER
-              sudo usermod -aG docker "$SSH_USER"
+            if [ -n "${SSH_PASS}" ]; then
+              echo "${SSH_USER}:${SSH_PASS}" | sudo chpasswd
+              echo "${SSH_USER} ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/"${SSH_USER}"
+              sudo usermod -aG docker "${SSH_USER}"
               sudo usermod -aG docker runner
             fi
 
             sudo systemctl stop docker containerd casaos
             sync
-          ) &
-          PID2=$!
+          ) & PID2=$!
 
-          wait $PID1 || exit 1
-          wait $PID2 || exit 1
-          echo "$LOG_PREFIX Parallel tasks finished"
+          # 1. 必须等 B 安装完成
+          wait "${PID2}"
+          echo "${LOG_PREFIX} Thread B (install) finished"
+
+          # 2. 读取是否有备份
+          if [ -f "${LOCAL_FILE_PATH}" ]; then
+            LOCAL_FILE=$(cat "${LOCAL_FILE_PATH}")
+            rm -f "${LOCAL_FILE_PATH}"
+          else
+            LOCAL_FILE=""
+          fi
+
+          # 3. 如果有备份才解压，没有就跳过
+          if [ -n "${LOCAL_FILE}" ] && [ -f "${LOCAL_FILE}" ]; then
+            echo "${LOG_PREFIX} Found backup, start restoring..."
+            sudo tar -I "zstd -d -T2" -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions 2>/dev/null
+            sudo rm -f "${LOCAL_FILE}"
+          else
+            echo "${LOG_PREFIX} No backup found, use clean install"
+          fi
+
+          # 4. 等 A 结束
+          wait "${PID1}"
+          echo "${LOG_PREFIX} All parallel tasks done"
 
       - name: 4-Start all services
         run: |
+          set -e
           sudo systemctl enable --now docker containerd
           sleep 2
           sudo systemctl enable --now casaos
-          echo "$LOG_PREFIX Docker: $(sudo systemctl is-active docker)"
-          echo "$LOG_PREFIX CasaOS: $(sudo systemctl is-active casaos)"
+          echo "${LOG_PREFIX} Docker: $(sudo systemctl is-active docker || true)"
+          echo "${LOG_PREFIX} CasaOS: $(sudo systemctl is-active casaos || true)"
 
       - name: 5-Stable running
         timeout-minutes: 360
         run: |
+          set -e
           SEC=$((TARGET_RUN_MINUTES*60))
           ELAPSED=0
-          while [ $ELAPSED -lt $SEC ]; do
+          while [ ${ELAPSED} -lt ${SEC} ]; do
             MIN=$((ELAPSED/60))
-            echo "$LOG_PREFIX Running: $MIN/$TARGET_RUN_MINUTES min"
+            echo "${LOG_PREFIX} Running: ${MIN}/${TARGET_RUN_MINUTES} min"
             sleep 60
             ELAPSED=$((ELAPSED+60))
           done
 
-      - name: 6-Backup, trigger, move and wait for delete
+      - name: 6-Backup, trigger, clean
         if: always()
         run: |
-          sudo mkdir -p "$LOCAL_BACKUP_DIR" "$LOCAL_AAA_DIR"
+          set -euo pipefail
+          sudo mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_AAA_DIR}"
           sudo systemctl stop casaos docker containerd
           sync
 
           SNAP="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
-          LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP"
-          sudo tar -I "zstd -6 -T2 --long=30" -cf "$LOCAL_FILE" \
+          LOCAL_FILE="${LOCAL_BACKUP_DIR}/${SNAP}"
+          sudo tar -I "zstd -6 -T2 --long=30" -cf "${LOCAL_FILE}" \
             --exclude='/*/logs' --exclude='/*/tmp' --exclude='/*/cache' \
-            $PERSONAL_DATA_DIRS || true
+            ${PERSONAL_DATA_DIRS} || true
 
-          if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
-            curl -s -f -X POST -H "Authorization: Bearer $USER_PAT" \
-            https://api.github.com/repos/"$REPO"/dispatches \
-            -d '{"event_type":"renew_casaos_snapshot"}'
+          if [ -n "${USER_PAT}" ] && [ -n "${REPO}" ]; then
+            curl -s -f -X POST \
+              -H "Authorization: Bearer ${USER_PAT}" \
+              https://api.github.com/repos/"${REPO}"/dispatches \
+              -d '{"event_type":"renew_casaos_snapshot"}' || true
           fi
 
-          if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
-            sudo mv "$LOCAL_FILE" "$LOCAL_AAA_DIR/"
-            TARGET_FILE="$LOCAL_AAA_DIR/$SNAP"
-
-            while [ -f "$TARGET_FILE" ]; do
-              echo "$LOG_PREFIX Waiting for backup to be pulled and deleted..."
-              sleep $POLL_INTERVAL
+          if [ -f "${LOCAL_FILE}" ] && [ -s "${LOCAL_FILE}" ]; then
+            sudo mv "${LOCAL_FILE}" "${LOCAL_AAA_DIR}/"
+            TARGET_FILE="${LOCAL_AAA_DIR}/${SNAP}"
+            while [ -f "${TARGET_FILE}" ]; do
+              echo "${LOG_PREFIX} Waiting for backup to be deleted..."
+              sleep "${POLL_INTERVAL}"
             done
           fi
 
-          sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/*
-          echo "$LOG_PREFIX All tasks finished"
+          sudo rm -rf "${LOCAL_BACKUP_DIR}" /tmp/*
+          echo "${LOG_PREFIX} All tasks finished"
