@@ -29,7 +29,6 @@ jobs:
     steps:
       - name: 1-Init + Tailscale networking
         run: |
-          set -euo pipefail
           echo "${LOG_PREFIX} Start init"
           sudo apt update -y -qq
           sudo apt install -y curl wget jq zstd rsync sshpass -qq
@@ -44,19 +43,16 @@ jobs:
 
       - name: 2-Prepare directories and permissions
         run: |
-          set -e
           sudo mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_AAA_DIR}" /run/docker
           sudo chown -R runner:runner "${LOCAL_BACKUP_DIR}" "${LOCAL_AAA_DIR}"
           echo "${LOG_PREFIX} Directories ready"
 
       - name: 3-Parallel: Pull backup + Install environment
         run: |
-          set -euo pipefail
           echo "${LOG_PREFIX} Start parallel tasks"
-
-          # 用临时文件传递子shell结果（解决子shell变量不往外传问题）
-          LOCAL_FILE_PATH="${LOCAL_BACKUP_DIR}/.backup_path"
-          rm -f "${LOCAL_FILE_PATH}"
+          mkdir -p "${LOCAL_BACKUP_DIR}"
+          FLAG_FILE="${LOCAL_BACKUP_DIR}/.backup_found"
+          rm -f "${FLAG_FILE}"
 
           # Thread A: 只拉取备份，不解压
           (
@@ -67,8 +63,8 @@ jobs:
                 if [ -n "${LATEST}" ]; then
                   LOCAL_FILE="${LOCAL_BACKUP_DIR}/$(basename "${LATEST}")"
                   sshpass -p "${SSH_PASS}" rsync -az --partial --rsh="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" "${SSH_USER}@${TARGET_IP}:${LATEST}" "${LOCAL_FILE}"
-                  sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "${SSH_USER}@${TARGET_IP}" "sudo rm -f \"${LATEST}\""
-                  echo "${LOCAL_FILE}" > "${LOCAL_FILE_PATH}"
+                  sshpass -p "${SSH_PASS}" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "${SSH_USER}@${TARGET_IP}" "sudo rm -f '${LATEST}'"
+                  echo "${LOCAL_FILE}" > "${FLAG_FILE}"
                 fi
               fi
             fi
@@ -91,44 +87,38 @@ jobs:
             sync
           ) & PID2=$!
 
-          # 1. 必须等 B 安装完成
+          # 先等 B 完成（安装+停服务）
           wait "${PID2}"
           echo "${LOG_PREFIX} Thread B (install) finished"
 
-          # 2. 读取是否有备份
-          if [ -f "${LOCAL_FILE_PATH}" ]; then
-            LOCAL_FILE=$(cat "${LOCAL_FILE_PATH}")
-            rm -f "${LOCAL_FILE_PATH}"
+          # 判断是否有备份
+          if [ -f "${FLAG_FILE}" ]; then
+            LOCAL_FILE=$(cat "${FLAG_FILE}")
+            rm -f "${FLAG_FILE}"
+            if [ -f "${LOCAL_FILE}" ]; then
+              echo "${LOG_PREFIX} Restore backup..."
+              sudo tar -I "zstd -d -T2" -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions 2>/dev/null
+              sudo rm -f "${LOCAL_FILE}"
+            fi
           else
-            LOCAL_FILE=""
+            echo "${LOG_PREFIX} No backup, use clean install"
           fi
 
-          # 3. 如果有备份才解压，没有就跳过
-          if [ -n "${LOCAL_FILE}" ] && [ -f "${LOCAL_FILE}" ]; then
-            echo "${LOG_PREFIX} Found backup, start restoring..."
-            sudo tar -I "zstd -d -T2" -xf "${LOCAL_FILE}" -C / --overwrite --preserve-permissions 2>/dev/null
-            sudo rm -f "${LOCAL_FILE}"
-          else
-            echo "${LOG_PREFIX} No backup found, use clean install"
-          fi
-
-          # 4. 等 A 结束
+          # 再等 A 结束
           wait "${PID1}"
           echo "${LOG_PREFIX} All parallel tasks done"
 
       - name: 4-Start all services
         run: |
-          set -e
           sudo systemctl enable --now docker containerd
           sleep 2
           sudo systemctl enable --now casaos
-          echo "${LOG_PREFIX} Docker: $(sudo systemctl is-active docker || true)"
-          echo "${LOG_PREFIX} CasaOS: $(sudo systemctl is-active casaos || true)"
+          echo "${LOG_PREFIX} Docker: $(sudo systemctl is-active docker 2>/dev/null || true)"
+          echo "${LOG_PREFIX} CasaOS: $(sudo systemctl is-active casaos 2>/dev/null || true)"
 
       - name: 5-Stable running
         timeout-minutes: 360
         run: |
-          set -e
           SEC=$((TARGET_RUN_MINUTES*60))
           ELAPSED=0
           while [ ${ELAPSED} -lt ${SEC} ]; do
@@ -141,7 +131,6 @@ jobs:
       - name: 6-Backup, trigger, clean
         if: always()
         run: |
-          set -euo pipefail
           sudo mkdir -p "${LOCAL_BACKUP_DIR}" "${LOCAL_AAA_DIR}"
           sudo systemctl stop casaos docker containerd
           sync
