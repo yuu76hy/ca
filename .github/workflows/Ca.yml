@@ -32,13 +32,11 @@ jobs:
           echo "$LOG_PREFIX Start init"
           sudo apt update -y -qq
           sudo apt install -y curl wget jq zstd rsync sshpass -qq
-          # FIX: 删除激进清理命令，避免破坏GitHub环境
           sudo rm -rf /tmp/* /var/tmp/*
 
           if [ -n "$TAILSCALE_AUTH_KEY" ]; then
             curl -fsSL https://tailscale.com/install.sh | sudo bash
             sudo systemctl enable --now tailscaled
-            # FIX: 使用GitHub唯一ID做主机名，避免重复
             sudo tailscale up --authkey="$TAILSCALE_AUTH_KEY" --hostname="github-runner-$GITHUB_RUN_ID" --accept-routes --reset
           fi
           echo "$LOG_PREFIX Tailscale connected and keep running"
@@ -52,27 +50,20 @@ jobs:
       - name: 3-Parallel: Pull backup + Install environment
         run: |
           echo "$LOG_PREFIX Start parallel tasks"
-          # 定义进程PID变量，捕获后台线程退出码
           PID1=0
           PID2=0
 
           # Thread A: Pull and restore backup
           (
             if [ -n "$TAILSCALE_AUTH_KEY" ] && [ -n "$SSH_PASS" ]; then
-              # FIX: jq字段改为Peers(复数)，修复IP获取失败
               TARGET_IP=$(sudo tailscale status --json | jq -r '.Peers[] | select(.Online == true and (.HostName | contains("github-runner"))) | .TailscaleIPs[0]' | head -n 1)
               if [ -n "$TARGET_IP" ]; then
-                # FIX: 全量变量加引号，禁用SSH主机检查(完整容错)
                 LATEST=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.zst 2>/dev/null | head -n 1")
                 if [ -n "$LATEST" ]; then
-                  # FIX: 变量加引号，避免文件名异常
                   LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename "$LATEST")"
                   sshpass -p "$SSH_PASS" rsync --partial --progress --rsh="ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=15" "$SSH_USER@$TARGET_IP:$LATEST" "$LOCAL_FILE"
-                  # FIX: 双引号解析变量，修复删除文件失败
                   sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" "sudo rm -f '$LATEST'"
-                  # FIX: GITHUB_ENV加引号，规范写入
                   echo "BACKUP_FILE=$LOCAL_FILE" >> "$GITHUB_ENV"
-                  # FIX: tar -I后加空格，修复解压语法错误
                   sudo tar -I "zstd -d -T2" -xf "$LOCAL_FILE" -C / --overwrite --preserve-permissions 2>/dev/null
                   sudo rm -f "$LOCAL_FILE"
                 fi
@@ -83,16 +74,13 @@ jobs:
 
           # Thread B: Install Docker/CasaOS and stop business services
           (
-            # FIX: sudo全局生效环境变量，避免apt交互弹窗
-            sudo DEBIAN_FRONTEND=noninteractive
-            # FIX: curl加-f，下载失败直接退出
-            curl -fsSL https://get.docker.com | sudo bash
-            curl -fsSL https://get.casaos.io | sudo bash || { sleep 3; curl -fsSL https://get.casaos.io | sudo bash; }
+            # FIX: 修正环境变量写法（命令前缀，非单独一行）→ 解决Line52核心报错
+            curl -fsSL https://get.docker.com | sudo DEBIAN_FRONTEND=noninteractive bash
+            curl -fsSL https://get.casaos.io | sudo DEBIAN_FRONTEND=noninteractive bash || { sleep 3; curl -fsSL https://get.casaos.io | sudo DEBIAN_FRONTEND=noninteractive bash; }
 
             if [ -n "$SSH_PASS" ]; then
               echo "$SSH_USER:$SSH_PASS" | sudo chpasswd
               echo "$SSH_USER ALL=(ALL) NOPASSWD: ALL" | sudo tee /etc/sudoers.d/$SSH_USER
-              # FIX: 拆分usermod命令，一次仅修改一个用户
               sudo usermod -aG docker "$SSH_USER"
               sudo usermod -aG docker runner
             fi
@@ -102,7 +90,6 @@ jobs:
           ) &
           PID2=$!
 
-          # FIX: 等待后台进程，并捕获退出码，失败终止Job
           wait $PID1 || exit 1
           wait $PID2 || exit 1
           echo "$LOG_PREFIX Parallel tasks finished"
@@ -112,7 +99,6 @@ jobs:
           sudo systemctl enable --now docker containerd
           sleep 2
           sudo systemctl enable --now casaos
-          # FIX: 添加sudo，普通用户可查询服务状态
           echo "$LOG_PREFIX Docker: $(sudo systemctl is-active docker)"
           echo "$LOG_PREFIX CasaOS: $(sudo systemctl is-active casaos)"
 
@@ -131,40 +117,31 @@ jobs:
       - name: 6-Backup, trigger, move and wait for delete
         if: always()
         run: |
-          # FIX: 重建目录，避免前置清理导致目录丢失
           sudo mkdir -p "$LOCAL_BACKUP_DIR" "$LOCAL_AAA_DIR"
-          
-          # Stop business services only, keep Tailscale running
           sudo systemctl stop casaos docker containerd
           sync
 
-          # Create backup
           SNAP="casaos-full-$(date +%Y%m%d-%H%M%S).tar.zst"
           LOCAL_FILE="$LOCAL_BACKUP_DIR/$SNAP"
           sudo tar -I "zstd -6 -T2 --long=30" -cf "$LOCAL_FILE" \
             --exclude='/*/logs' --exclude='/*/tmp' --exclude='/*/cache' \
             $PERSONAL_DATA_DIRS || true
 
-          # Trigger next workflow
           if [ -n "$USER_PAT" ] && [ -n "$REPO" ]; then
-            # FIX: GitHub API认证改为Bearer，废弃token前缀
             curl -s -f -X POST -H "Authorization: Bearer $USER_PAT" \
             https://api.github.com/repos/"$REPO"/dispatches \
             -d '{"event_type":"renew_casaos_snapshot"}'
           fi
 
-          # Move backup to /aaa
           if [ -f "$LOCAL_FILE" ] && [ -s "$LOCAL_FILE" ]; then
             sudo mv "$LOCAL_FILE" "$LOCAL_AAA_DIR/"
             TARGET_FILE="$LOCAL_AAA_DIR/$SNAP"
 
-            # Wait until backup is deleted by next node
             while [ -f "$TARGET_FILE" ]; do
               echo "$LOG_PREFIX Waiting for backup to be pulled and deleted..."
               sleep $POLL_INTERVAL
             done
           fi
 
-          # Clean up
           sudo rm -rf "$LOCAL_BACKUP_DIR" /tmp/*
           echo "$LOG_PREFIX All tasks finished"
