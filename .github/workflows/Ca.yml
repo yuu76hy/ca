@@ -7,7 +7,7 @@ on:
 env:
   ZSTD_COMPRESS_LEVEL: 6
   POLL_INTERVAL: 30
-  TARGET_RUN_MINUTES: 10  # 这里已改为 10 分钟
+  TARGET_RUN_MINUTES: 330
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
