@@ -7,7 +7,7 @@ on:
 env:
   ZSTD_COMPRESS_LEVEL: 6
   POLL_INTERVAL: 30
-  TARGET_RUN_MINUTES: 330
+  TARGET_RUN_MINUTES: 10  # 这里从 330 改为 10
   PERSONAL_DATA_DIRS: "/var/lib/docker /etc/casaos /var/lib/casaos /DATA"
   REMOTE_BACKUP_BASE: "/aaa"
   LOCAL_BACKUP_DIR: "/tmp/casaos-backup"
@@ -53,9 +53,9 @@ jobs:
           # Thread A: Pull and restore backup
           (
             if [ -n "$TAILSCALE_AUTH_KEY" ] && [ -n "$SSH_PASS" ]; then
-              TARGET_IP=$(sudo tailscale status --json | jq -r '.Peer[] | select(.Online==true and (.HostName | contains("CA"))) | .TailscaleIPs[0]' | head -1)
+              TARGET_IP=$(sudo tailscale status --json | jq -r '.Peer[] | select(.Online == true and (.HostName | contains("CA"))) | .TailscaleIPs[0]' | head -n 1)
               if [ -n "$TARGET_IP" ]; then
-                LATEST=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.zst 2>/dev/null | head -1")
+                LATEST=$(sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 "$SSH_USER@$TARGET_IP" "ls -t $REMOTE_BACKUP_BASE/casaos-*.tar.zst 2>/dev/null | head -n 1")
                 if [ -n "$LATEST" ]; then
                   LOCAL_FILE="$LOCAL_BACKUP_DIR/$(basename $LATEST)"
                   sshpass -p "$SSH_PASS" rsync --partial --progress --rsh="ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15" "$SSH_USER@$TARGET_IP:$LATEST" "$LOCAL_FILE"
